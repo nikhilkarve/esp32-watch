@@ -2,169 +2,336 @@
 #include <TinyGPSPlus.h>
 #include <U8g2lib.h>
 
+// --------------------
+// Hardware
+// --------------------
+
 #define BUTTON_PIN 4
 
 HardwareSerial GPSSerial(1);
 TinyGPSPlus gps;
 
-unsigned long lastUpdate = 0;
-const unsigned long UPDATE_TIME = 1000;
-// Timing tracking variables
-unsigned long totalActiveTime = 0;  // Cumulative time spent running (ms)
-unsigned long lastStateChange =
-    0;  // Timestamp when state last transitioned (ms)
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(
+    U8G2_R0,
+    /* reset = */ U8X8_PIN_NONE
+);
 
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
+// --------------------
+// Timing
+// --------------------
 
-enum WatchState { IDLE, RUNNING, PAUSED };
+const unsigned long DISPLAY_UPDATE_MS = 1000;
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONG_PRESS_MS = 2000;
 
-enum ButtonEvent { NONE, SHORT_PRESS, LONG_PRESS };
+// --------------------
+// Watch state
+// --------------------
+
+enum WatchState {
+    IDLE,
+    RUNNING,
+    PAUSED
+};
+
+enum ButtonEvent {
+    NONE,
+    SHORT_PRESS,
+    LONG_PRESS
+};
 
 WatchState watchState = IDLE;
 
-int counter = 0;
+// --------------------
+// Run timing
+// --------------------
+
+// Total time accumulated from previous RUNNING segments.
+unsigned long activeTime = 0;
+
+// When the current RUNNING segment started.
+unsigned long activeSegmentStart = 0;
+
+// Used to control display refresh rate.
+unsigned long lastDisplayUpdate = 0;
+
+
+// ============================================================
+// DISPLAY
+// ============================================================
 
 void displayInfo() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
 
-  switch (watchState) {
-    case IDLE:
-      u8g2.drawStr(0, 10, "IDLE MODE");
-      break;
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
 
-    case RUNNING: {
-      u8g2.drawStr(0, 10, "--GPS COORDINATES--");
-      unsigned long currentRunDuration =
-          totalActiveTime + (millis() - lastStateChange);
+    switch (watchState) {
 
-      // Convert milliseconds to MM:SS format
-      unsigned long totalSeconds = currentRunDuration / 1000;
-      unsigned int mins = totalSeconds / 60;
-      unsigned int secs = totalSeconds % 60;
+        case IDLE:
+            u8g2.drawStr(0, 10, "IDLE MODE");
+            break;
 
-      char timeBuffer[16];
-      snprintf(timeBuffer, sizeof(timeBuffer), "TIME: %02u:%02u", mins, secs);
-      u8g2.drawStr(0, 56, timeBuffer);
 
-      char latBuffer[20];
-      char lngBuffer[20];
+        case RUNNING: {
 
-      if (gps.location.isValid()) {
-        char* latValue = dtostrf(gps.location.lat(), 10, 6, latBuffer);
+            u8g2.drawStr(0, 10, "--GPS COORDINATES--");
 
-        char* lngValue = dtostrf(gps.location.lng(), 10, 6, lngBuffer);
+            // Time from previous running segments
+            // + time spent in the current running segment.
+            unsigned long currentRunTime =
+                activeTime + (millis() - activeSegmentStart);
+
+            displayRunTime(currentRunTime);
+
+            displayCoordinates();
+
+            break;
+        }
+
+
+        case PAUSED: {
+
+            u8g2.drawStr(0, 10, "RUN PAUSED");
+
+            displayRunTime(activeTime);
+
+            break;
+        }
+    }
+
+    u8g2.sendBuffer();
+}
+
+
+// ============================================================
+// DISPLAY HELPERS
+// ============================================================
+
+void displayRunTime(unsigned long timeMs) {
+
+    unsigned long totalSeconds = timeMs / 1000;
+
+    unsigned int minutes = totalSeconds / 60;
+    unsigned int seconds = totalSeconds % 60;
+
+    char timeBuffer[20];
+
+    snprintf(
+        timeBuffer,
+        sizeof(timeBuffer),
+        "TIME: %02u:%02u",
+        minutes,
+        seconds
+    );
+
+    u8g2.drawStr(0, 56, timeBuffer);
+}
+
+
+void displayCoordinates() {
+
+    char latBuffer[20];
+    char lngBuffer[20];
+
+    if (gps.location.isValid()) {
+
+        char* latValue = dtostrf(
+            gps.location.lat(),
+            10,
+            6,
+            latBuffer
+        );
+
+        char* lngValue = dtostrf(
+            gps.location.lng(),
+            10,
+            6,
+            lngBuffer
+        );
 
         u8g2.drawStr(0, 22, latValue);
         u8g2.drawStr(0, 44, lngValue);
-      } else {
+
+    } else {
+
         u8g2.drawStr(0, 32, "Locating..");
-      }
-      break;
     }
-
-    case PAUSED: {
-      u8g2.drawStr(0, 10, "RUN PAUSED");
-
-      unsigned long totalSecondsPaused = totalActiveTime / 1000;
-      unsigned int minsPaused = totalSecondsPaused / 60;
-      unsigned int secsPaused = totalSecondsPaused % 60;
-
-      char timeBuffer[16];
-      snprintf(timeBuffer, sizeof(timeBuffer), "PAUSED: %02u:%02u", minsPaused, secsPaused);
-      u8g2.drawStr(0, 32, timeBuffer);
-      break;
-    }
-  }
-
-  u8g2.sendBuffer();
 }
+
+
+// ============================================================
+// BUTTON
+// ============================================================
 
 ButtonEvent checkButton() {
-  static bool lastState = HIGH;
-  static unsigned long lastChangeTime = 0;
-  static unsigned long pressStartTime = 0;
-  const unsigned long DEBOUNCE_MS = 50;
 
-  bool currentState = digitalRead(BUTTON_PIN);
+    static bool lastState = HIGH;
+    static unsigned long lastChangeTime = 0;
+    static unsigned long pressStartTime = 0;
 
-  if (currentState != lastState && (millis() - lastChangeTime) >= DEBOUNCE_MS) {
-    lastState = currentState;
-    lastChangeTime = millis();
+    bool currentState = digitalRead(BUTTON_PIN);
 
-    if (currentState == LOW) {
-      pressStartTime = millis();
-    } else {
-      unsigned long duration = millis() - pressStartTime;
+    // Has the electrical state changed?
+    if (currentState != lastState) {
 
-      if (duration >= 2000) {
-        return LONG_PRESS;
-      } else if (duration >= DEBOUNCE_MS) {
+        // Ignore changes happening too quickly.
+        if (millis() - lastChangeTime < DEBOUNCE_MS) {
+            return NONE;
+        }
+
+        lastState = currentState;
+        lastChangeTime = millis();
+
+
+        // Button was pressed.
+        if (currentState == LOW) {
+
+            pressStartTime = millis();
+
+            return NONE;
+        }
+
+
+        // Button was released.
+        unsigned long pressDuration =
+            millis() - pressStartTime;
+
+        if (pressDuration >= LONG_PRESS_MS) {
+            return LONG_PRESS;
+        }
+
         return SHORT_PRESS;
-      }
     }
-  }
 
-  return NONE;
+    return NONE;
 }
 
-void checkWatchState(ButtonEvent isPressed) {
-  if (isPressed != NONE) {
-    Serial.print("Current watch state: ");
+
+// ============================================================
+// WATCH STATE MACHINE
+// ============================================================
+
+void handleButtonEvent(ButtonEvent event) {
+
+    if (event == NONE) {
+        return;
+    }
+
+    Serial.print("Current state: ");
     Serial.println(watchState);
+
 
     switch (watchState) {
-      case IDLE:
-        if (isPressed == SHORT_PRESS) {
-          totalActiveTime = 0;         // Reset timer for a fresh run
-          lastStateChange = millis();  // Mark the start time
-          watchState = RUNNING;
-        }
-        break;
 
-      case RUNNING:
-        if (isPressed == SHORT_PRESS) {
-          totalActiveTime +=
-              millis() - lastStateChange;  // Lock in active time spent
-          watchState = PAUSED;
-        }
-        break;
+        case IDLE:
 
-      case PAUSED:
-        if (isPressed == SHORT_PRESS) {
-          lastStateChange = millis();  // Reset segment start time for resume
-          watchState = RUNNING;
-        } else if (isPressed == LONG_PRESS) {
-          totalActiveTime = 0;  // Reset timer when quitting
-          watchState = IDLE;
-        }
-        break;
+            if (event == SHORT_PRESS) {
+
+                // Start a brand-new run.
+                activeTime = 0;
+                activeSegmentStart = millis();
+
+                watchState = RUNNING;
+            }
+
+            break;
+
+
+        case RUNNING:
+
+            if (event == SHORT_PRESS) {
+
+                // Save the time spent in this
+                // RUNNING segment.
+                activeTime +=
+                    millis() - activeSegmentStart;
+
+                watchState = PAUSED;
+            }
+
+            break;
+
+
+        case PAUSED:
+
+            if (event == SHORT_PRESS) {
+
+                // Start a new running segment.
+                activeSegmentStart = millis();
+
+                watchState = RUNNING;
+
+            } else if (event == LONG_PRESS) {
+
+                // Throw away the current run.
+                activeTime = 0;
+
+                watchState = IDLE;
+            }
+
+            break;
     }
 
-    Serial.print("Watch state changed to: ");
+
+    Serial.print("New state: ");
     Serial.println(watchState);
 
     displayInfo();
-    lastUpdate = millis();
-  }
+
+    lastDisplayUpdate = millis();
 }
+
+
+// ============================================================
+// SETUP
+// ============================================================
 
 void setup() {
-  Serial.begin(115200);
-  u8g2.begin();
-  GPSSerial.begin(115200, SERIAL_8N1, 2, 1);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  Serial.println("Listening for GPS...");
+
+    Serial.begin(115200);
+
+    u8g2.begin();
+
+    GPSSerial.begin(
+        115200,
+        SERIAL_8N1,
+        2,
+        1
+    );
+
+    pinMode(
+        BUTTON_PIN,
+        INPUT_PULLUP
+    );
+
+    Serial.println("GPS Watch started.");
 }
 
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
 void loop() {
-  while (GPSSerial.available()) {
-    gps.encode(GPSSerial.read());
-  }
-  ButtonEvent isPressed = checkButton();
-  checkWatchState(isPressed);
-  if (millis() - lastUpdate >= UPDATE_TIME) {
-    lastUpdate = millis();
-    displayInfo();
-  }
+
+    // Continuously process incoming GPS data.
+    while (GPSSerial.available()) {
+        gps.encode(GPSSerial.read());
+    }
+
+
+    // Check whether the user pressed the button.
+    ButtonEvent event = checkButton();
+
+    // Apply the button event to the watch state machine.
+    handleButtonEvent(event);
+
+
+    // Refresh the OLED once per second.
+    if (millis() - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
+
+        lastDisplayUpdate = millis();
+
+        displayInfo();
+    }
 }
